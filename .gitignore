@@ -1,0 +1,8 @@
+.env
+venv
+proxies.txt
+results
+test.py
+__pycache__
+test.json
+example_product_list.csv
