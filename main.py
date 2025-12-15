@@ -6,10 +6,6 @@ from collections import deque
 
 
 async def main_async():
-    proxies = {
-        "http": "http://127.0.0.1:8080",
-        "https": "http://127.0.0.1:8080"
-    }
     lowes = LOWES()
 
     products = lowes.load_products('Lowes Products 2025 12 09.csv')
@@ -43,6 +39,8 @@ async def main_async():
 
     print(f"Filtered {len(stores)} to {len(valid_stores)} valid stores ({len(stores) - len(valid_stores)} invalid)")
 
+    test_store = valid_stores[0] if valid_stores else None
+
     # Calculate expected results
     total_combinations = len(valid_products) * len(valid_stores)
     print(f"🚀 Total combinations to process: {total_combinations:,} ({len(valid_products):,} products × {len(valid_stores)} stores)")
@@ -58,7 +56,7 @@ async def main_async():
         writer = csv.writer(f)
         writer.writerow(headers)
 
-    # Home Depot-style concurrency configuration
+    # Optimized concurrency configuration for token reuse
     NUM_WORKERS = 10  # Number of concurrent workers
     REQUESTS_PER_MINUTE = 60  # Per worker rate limit
     TOKEN_VALIDITY_MINUTES = 15
@@ -75,10 +73,9 @@ async def main_async():
     # Global concurrency control
     global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
     write_lock = asyncio.Lock()
-    processed_count = asyncio.Event()  # Track completion
 
     async def worker(worker_id):
-        """Home Depot-style worker with rate limiting and token reuse"""
+        """Worker with token reuse across multiple products"""
         request_times = deque(maxlen=REQUESTS_PER_MINUTE)  # Track request timestamps
 
         async with aiohttp.ClientSession(
@@ -86,10 +83,11 @@ async def main_async():
             connector=aiohttp.TCPConnector(limit=50)  # Per-worker connection limit
         ) as session:
 
-            # Initialize token and headers
+            # Initialize token and headers (reused across multiple products)
             token = None
             headers = None
             token_start_time = 0
+            products_processed_with_token = 0
 
             while True:
                 # Check if work is done
@@ -108,8 +106,11 @@ async def main_async():
                         sleep_time = 60 - time_since_oldest
                         await asyncio.sleep(sleep_time)
 
-                # Token management: get new token if needed
-                if token is None or (now - token_start_time) > (TOKEN_VALIDITY_MINUTES * 60):
+                # Token management: get new token if needed or expired
+                if (token is None or
+                    (now - token_start_time) > (TOKEN_VALIDITY_MINUTES * 60) or
+                    products_processed_with_token >= 100):  # Refresh after 100 products
+
                     # Get new token
                     device_id = str(uuid.uuid4()).upper()
                     headers = lowes.headers.copy()
@@ -129,6 +130,7 @@ async def main_async():
 
                     token = new_token
                     token_start_time = now
+                    products_processed_with_token = 0
 
                 # Global concurrency control
                 async with global_semaphore:
@@ -140,6 +142,7 @@ async def main_async():
 
                         # Record request time for rate limiting
                         request_times.append(time.time())
+                        products_processed_with_token += 1
 
                         if success:
                             # Save successful result
@@ -171,8 +174,7 @@ async def main_async():
     workers = [worker(i) for i in range(NUM_WORKERS)]
     await asyncio.gather(*workers)
 
-    # Wait for all tasks to complete
-    await combination_queue.join()
+    # All tasks completed
 
     print("All combinations processed!")
     return total_combinations
