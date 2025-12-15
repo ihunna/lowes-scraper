@@ -62,26 +62,20 @@ async def main_async():
     TOKEN_VALIDITY_MINUTES = 15
     GLOBAL_CONCURRENCY_LIMIT = 200  # Overall concurrent requests
 
-    # Create queue of all product-store combinations
-    combination_queue = asyncio.Queue()
-    for product in valid_products:
-        for store in valid_stores:
-            await combination_queue.put((product, store))
-
-    print(f"Created queue with {combination_queue.qsize()} combinations")
-
-    # Global concurrency control
+    # Distribute products among workers to ensure concurrent processing
     global_semaphore = asyncio.Semaphore(GLOBAL_CONCURRENCY_LIMIT)
     write_lock = asyncio.Lock()
 
     async def worker(worker_id):
         """Worker with token reuse across multiple products"""
+        print(f"Worker {worker_id}: Starting")
         request_times = deque(maxlen=REQUESTS_PER_MINUTE)  # Track request timestamps
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
             connector=aiohttp.TCPConnector(limit=50)  # Per-worker connection limit
         ) as session:
+            print(f"Worker {worker_id}: Session created, processing {len(valid_products[worker_id::NUM_WORKERS])} products")
 
             # Initialize token and headers (reused across multiple products)
             token = None
@@ -89,90 +83,91 @@ async def main_async():
             token_start_time = 0
             products_processed_with_token = 0
 
-            while True:
-                # Check if work is done
-                try:
-                    product, store = combination_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break  # No more work
+            # Get products assigned to this worker
+            worker_products = valid_products[worker_id::NUM_WORKERS]
 
-                # Rate limiting: ensure we don't exceed per-minute limit
-                now = time.time()
-                if len(request_times) >= REQUESTS_PER_MINUTE:
-                    # Calculate time to wait to maintain rate limit
-                    oldest_request = request_times[0]
-                    time_since_oldest = now - oldest_request
-                    if time_since_oldest < 60:  # Within 1 minute window
-                        sleep_time = 60 - time_since_oldest
-                        await asyncio.sleep(sleep_time)
+            for product in worker_products:
+                # Process this product at all stores
+                for store in valid_stores:
+                    # Rate limiting: ensure we don't exceed per-minute limit
+                    now = time.time()
+                    if len(request_times) >= REQUESTS_PER_MINUTE:
+                        # Calculate time to wait to maintain rate limit
+                        oldest_request = request_times[0]
+                        time_since_oldest = now - oldest_request
+                        if time_since_oldest < 60:  # Within 1 minute window
+                            sleep_time = 60 - time_since_oldest
+                            await asyncio.sleep(sleep_time)
 
-                # Token management: get new token if needed or expired
-                if (token is None or
-                    (now - token_start_time) > (TOKEN_VALIDITY_MINUTES * 60) or
-                    products_processed_with_token >= 100):  # Refresh after 100 products
+                    # Token management: get new token if needed or expired
+                    if (token is None or
+                        (now - token_start_time) > (TOKEN_VALIDITY_MINUTES * 60) or
+                        products_processed_with_token >= 100):  # Refresh after 100 products
 
-                    # Get new token
-                    device_id = str(uuid.uuid4()).upper()
-                    headers = lowes.headers.copy()
-                    headers.update({
-                        'deviceid': device_id,
-                        'epid': str(uuid.uuid4()).upper(),
-                        'adid': lowes.generate_sensor_data(type="random_number"),
-                        'x-lowes-uuid': f'ca829819-f33a-44c5-b294-{lowes.generate_sensor_data(type="random_string")}',
-                        'x-acf-sensor-data': lowes.generate_sensor_data(type="sensor_data"),
-                    })
+                        # Get new token
+                        device_id = str(uuid.uuid4()).upper()
+                        headers = lowes.headers.copy()
+                        headers.update({
+                            'deviceid': device_id,
+                            'epid': str(uuid.uuid4()).upper(),
+                            'adid': lowes.generate_sensor_data(type="random_number"),
+                            'x-lowes-uuid': f'ca829819-f33a-44c5-b294-{lowes.generate_sensor_data(type="random_string")}',
+                            'x-acf-sensor-data': lowes.generate_sensor_data(type="sensor_data"),
+                        })
 
-                    success_token, new_token, _ = await lowes.get_token_async(headers, worker_id, delay=0.1, timeout=30)
-                    if not success_token:
-                        print(f'Worker {worker_id}: Failed to get token, skipping combination')
-                        combination_queue.task_done()
-                        continue
+                        success_token, new_token, _ = await lowes.get_token_async(headers, worker_id, delay=0.1, timeout=30)
+                        if not success_token:
+                            print(f'Worker {worker_id}: Failed to get token for {product["SKU"]}, skipping')
+                            continue
 
-                    token = new_token
-                    token_start_time = now
-                    products_processed_with_token = 0
+                        token = new_token
+                        token_start_time = now
+                        products_processed_with_token = 0
 
-                # Global concurrency control
-                async with global_semaphore:
-                    try:
-                        # Call scan_items_async with provided headers and token
-                        success, result = await lowes.scan_items_async(
-                            session, store, product, headers, token, delay=0.1, timeout=30
-                        )
+                    # Global concurrency control
+                    async with global_semaphore:
+                        try:
+                            # Call scan_items_async with provided headers and token
+                            success, result = await lowes.scan_items_async(
+                                session, store, product, headers, token, delay=0.1, timeout=30
+                            )
 
-                        # Record request time for rate limiting
-                        request_times.append(time.time())
-                        products_processed_with_token += 1
+                            # Record request time for rate limiting
+                            request_times.append(time.time())
+                            products_processed_with_token += 1
 
-                        if success:
-                            # Save successful result
-                            async with write_lock:
-                                with open(f'{results_folder}/{csv_file}', 'a', encoding='utf-8', newline='') as f:
-                                    writer = csv.writer(f)
-                                    writer.writerow(result['data'].values())
-                        else:
-                            # Handle API errors
-                            if isinstance(result, dict) and result.get('status') == 401:
-                                # Token expired - will refresh on next iteration
-                                print(f'Worker {worker_id}: Token expired, will refresh')
-                                token = None  # Force token refresh
+                            if success:
+                                # Save successful result
+                                async with write_lock:
+                                    with open(f'{results_folder}/{csv_file}', 'a', encoding='utf-8', newline='') as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow(result['data'].values())
                             else:
-                                # Handle both dict and string result types
-                                if isinstance(result, dict):
-                                    error_msg = result.get('message', str(result))
+                                # Handle API errors
+                                if isinstance(result, dict) and result.get('status') == 401:
+                                    # Token expired - will refresh on next iteration
+                                    print(f'Worker {worker_id}: Token expired, will refresh')
+                                    token = None  # Force token refresh
                                 else:
-                                    error_msg = str(result)
-                                print(f'Worker {worker_id}: API error for {product["SKU"]} at {store["store_name"]}: {error_msg}')
+                                    # Handle both dict and string result types
+                                    if isinstance(result, dict):
+                                        error_msg = result.get('message', str(result))
+                                    else:
+                                        error_msg = str(result)
+                                    print(f'Worker {worker_id}: API error for {product["SKU"]} at {store["store_name"]}: {error_msg}')
 
-                    except Exception as e:
-                        print(f'Worker {worker_id}: Exception processing {product["SKU"]} at {store["store_name"]}: {e}')
-
-                combination_queue.task_done()
+                        except Exception as e:
+                            print(f'Worker {worker_id}: Exception processing {product["SKU"]} at {store["store_name"]}: {e}')
 
     # Create and run workers
-    print(f"Starting {NUM_WORKERS} workers...")
-    workers = [worker(i) for i in range(NUM_WORKERS)]
-    await asyncio.gather(*workers)
+    print(f"Starting {NUM_WORKERS} workers with distributed products...")
+    workers = []
+    for i in range(NUM_WORKERS):
+        task = asyncio.create_task(worker(i))
+        workers.append(task)
+
+    # Wait for all workers to complete
+    await asyncio.gather(*workers, return_exceptions=True)
 
     # All tasks completed
 
